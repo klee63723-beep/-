@@ -35,6 +35,8 @@ body {
   width: 100%;
   min-height: 100%;
   overflow: hidden;
+  overscroll-behavior: none;
+  touch-action: none;
 }
 
 body {
@@ -56,6 +58,7 @@ input {
   overflow: hidden;
   isolation: isolate;
   cursor: grab;
+  touch-action: none;
 }
 
 .app.is-pointer-down,
@@ -72,6 +75,7 @@ input {
     linear-gradient(rgba(125, 125, 116, 0.06) 1px, transparent 1px),
     var(--bg);
   background-size: 48px 48px;
+  touch-action: none;
 }
 
 .world {
@@ -158,12 +162,20 @@ input {
   box-shadow: 0 18px 50px rgba(15, 15, 12, 0.14);
   backdrop-filter: blur(18px);
   transition: box-shadow 140ms ease, transform 140ms ease, border-color 140ms ease;
+  touch-action: none;
 }
 
 .media-block.is-held {
   border-color: color-mix(in srgb, var(--grab) 58%, var(--line));
   box-shadow: 0 22px 70px rgba(255, 88, 79, 0.22);
   transform: scale(1.015);
+}
+
+.image-block.is-stack-target {
+  border-color: color-mix(in srgb, var(--cursor) 62%, var(--line));
+  box-shadow:
+    0 0 0 6px color-mix(in srgb, var(--cursor) 14%, transparent),
+    0 22px 70px rgba(23, 105, 255, 0.18);
 }
 
 .delete-block {
@@ -199,6 +211,20 @@ input {
   background: #fff;
 }
 
+.delete-block.is-bar-selected,
+.upload-fab.is-bar-selected {
+  outline: 2px solid var(--cursor);
+  outline-offset: 4px;
+  box-shadow:
+    0 0 0 7px color-mix(in srgb, var(--cursor) 18%, transparent),
+    var(--shadow);
+}
+
+.delete-block.is-bar-selected {
+  opacity: 1;
+  transform: scale(1);
+}
+
 .media-block img,
 .model-preview {
   display: block;
@@ -207,6 +233,9 @@ input {
   min-height: 170px;
   object-fit: cover;
   background: #222;
+  transform-origin: 0 0;
+  touch-action: none;
+  will-change: transform;
 }
 
 .model-preview {
@@ -301,6 +330,10 @@ input {
   color: var(--grab);
 }
 
+.gesture-chip.is-pinching {
+  color: var(--cursor);
+}
+
 .upload-fab {
   right: 22px;
   bottom: 22px;
@@ -369,6 +402,11 @@ input {
   border-color: var(--grab);
   background: color-mix(in srgb, var(--grab) 24%, transparent);
   transform: translate3d(var(--cursor-x, 50vw), var(--cursor-y, 50vh), 0) scale(0.68);
+}
+
+.hand-cursor.is-pinching {
+  border-color: var(--cursor);
+  background: color-mix(in srgb, var(--cursor) 18%, transparent);
 }
 
 @media (max-width: 720px) {
