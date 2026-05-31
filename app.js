@@ -19,12 +19,18 @@ const LONG_PRESS_MOVE_TOLERANCE = 10;
 const STACK_OVERLAP_THRESHOLD = 0.32;
 const HAND_PINCH_MOVE_DEADZONE = 3;
 const HAND_PINCH_ZOOM_SENSITIVITY = 0.006;
+const SHAKE_WINDOW_MS = 820;
+const SHAKE_MIN_STEP = 10;
+const SHAKE_REVERSALS_TO_DETACH = 3;
+const SHAKE_MIN_TRAVEL = 120;
+const STACK_DETACH_COOLDOWN_MS = 900;
 
 const state = {
   pan: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
   scale: 1,
   mediaCount: 0,
   nextLayer: 1,
+  nextStackId: 1,
   lastVideoTime: -1,
   hand: {
     active: false,
@@ -33,7 +39,8 @@ const state = {
     pinchDirection: "",
     lastPoint: null,
     heldBlock: null,
-    movedHeldBlock: false
+    movedHeldBlock: false,
+    shake: null
   },
   pointer: {
     active: false,
@@ -244,6 +251,7 @@ function handleHandLandmarkerResults(results) {
     const dy = point.y - state.hand.lastPoint.y;
 
     if (state.hand.heldBlock) {
+      trackStackShake(state.hand.heldBlock, state.hand.shake, dx, dy);
       moveBlockBy(state.hand.heldBlock, dx, dy);
       updateStackHover(state.hand.heldBlock);
       state.hand.movedHeldBlock = true;
@@ -274,6 +282,7 @@ function holdBlockAtPoint(point) {
   const block = document.elementFromPoint(point.x, point.y)?.closest(".media-block");
   state.hand.heldBlock = block || null;
   state.hand.movedHeldBlock = false;
+  state.hand.shake = block ? createShakeTracker() : null;
   state.hand.heldBlock?.classList.add("is-held");
 }
 
@@ -286,6 +295,7 @@ function releaseHeldBlock() {
   state.hand.heldBlock?.classList.remove("is-held");
   state.hand.heldBlock = null;
   state.hand.movedHeldBlock = false;
+  state.hand.shake = null;
 }
 
 function resetHandState() {
@@ -296,6 +306,7 @@ function resetHandState() {
   state.hand.pinchDirection = "";
   state.hand.lastPoint = null;
   state.hand.movedHeldBlock = false;
+  state.hand.shake = null;
 }
 
 function getGestureLabel(grabbing) {
@@ -327,6 +338,10 @@ function updateHandPinchZoom(point, wasPinching) {
 }
 
 function moveBlockBy(block, dx, dy) {
+  getMoveTargets(block).forEach((target) => moveSingleBlockBy(target, dx, dy));
+}
+
+function moveSingleBlockBy(block, dx, dy) {
   const left = parseFloat(block.style.left) + dx / state.scale;
   const top = parseFloat(block.style.top) + dy / state.scale;
   block.style.left = `${left}px`;
@@ -643,9 +658,11 @@ function createDeleteButton() {
 }
 
 function removeMediaBlock(block) {
+  const stackId = block.dataset.stackId;
   if (block.dataset.objectUrl) URL.revokeObjectURL(block.dataset.objectUrl);
   if (block.contains(state.selectedBar)) deselectBar();
   block.remove();
+  cleanupStack(stackId);
   state.mediaCount = Math.max(0, state.mediaCount - 1);
   if (state.hand.heldBlock === block) releaseHeldBlock();
   emptyNote.classList.toggle("is-hidden", state.mediaCount > 0);
@@ -971,6 +988,7 @@ function panMediaBy(element, dx, dy) {
 
 function updateStackHover(block) {
   if (!isStackableImageBlock(block)) return;
+  if (isStackDetachCoolingDown(block)) return;
 
   const target = findStackTarget(block);
   clearStackHover(block);
@@ -979,13 +997,16 @@ function updateStackHover(block) {
 
 function settleImageStack(block) {
   if (!isStackableImageBlock(block)) return;
+  if (isStackDetachCoolingDown(block)) {
+    clearStackHover(block);
+    return;
+  }
 
   const target = findStackTarget(block);
   clearStackHover(block);
   if (!target) return;
 
-  setTopLayer(block);
-  block.classList.add("is-stacked");
+  mergeImageStacks(block, target);
 }
 
 function clearStackHover(exceptBlock) {
@@ -1001,6 +1022,7 @@ function findStackTarget(block) {
 
   document.querySelectorAll(".image-block").forEach((candidate) => {
     if (candidate === block) return;
+    if (candidate.dataset.stackId && candidate.dataset.stackId === block.dataset.stackId) return;
 
     const ratio = getOverlapRatio(draggedRect, candidate.getBoundingClientRect());
     if (ratio > bestRatio) {
@@ -1024,6 +1046,130 @@ function isStackableImageBlock(block) {
   return block.classList.contains("image-block");
 }
 
+function createShakeTracker() {
+  return {
+    samples: [],
+    detached: false
+  };
+}
+
+function trackStackShake(block, tracker, dx, dy) {
+  if (!tracker || tracker.detached || !block.dataset.stackId) return false;
+
+  const absX = Math.abs(dx);
+  const absY = Math.abs(dy);
+  const axis = absX >= absY ? "x" : "y";
+  const amount = axis === "x" ? dx : dy;
+
+  if (Math.abs(amount) < SHAKE_MIN_STEP) return false;
+
+  const now = performance.now();
+  tracker.samples.push({
+    axis,
+    direction: amount > 0 ? 1 : -1,
+    travel: Math.abs(amount),
+    time: now
+  });
+  tracker.samples = tracker.samples.filter((sample) => now - sample.time <= SHAKE_WINDOW_MS);
+
+  const stats = getShakeStats(tracker.samples);
+  if (stats.reversals < SHAKE_REVERSALS_TO_DETACH || stats.travel < SHAKE_MIN_TRAVEL) return false;
+
+  tracker.detached = detachBlockFromStack(block);
+  tracker.samples = [];
+  return tracker.detached;
+}
+
+function getShakeStats(samples) {
+  let reversals = 0;
+  let travel = 0;
+  let previous = null;
+
+  samples.forEach((sample) => {
+    travel += sample.travel;
+    if (previous && previous.axis === sample.axis && previous.direction !== sample.direction) {
+      reversals += 1;
+    }
+    previous = sample;
+  });
+
+  return { reversals, travel };
+}
+
+function detachBlockFromStack(block) {
+  const stackId = block.dataset.stackId;
+  if (!stackId) return false;
+
+  delete block.dataset.stackId;
+  block.classList.remove("is-stacked", "is-stack-target");
+  block.classList.add("is-unstacking");
+  block.dataset.detachedAt = String(performance.now());
+  setTopLayer(block);
+  cleanupStack(stackId);
+
+  window.setTimeout(() => {
+    block.classList.remove("is-unstacking");
+    delete block.dataset.detachedAt;
+  }, STACK_DETACH_COOLDOWN_MS);
+
+  return true;
+}
+
+function isStackDetachCoolingDown(block) {
+  const detachedAt = Number(block.dataset.detachedAt || 0);
+  return Boolean(detachedAt) && performance.now() - detachedAt < STACK_DETACH_COOLDOWN_MS;
+}
+
+function mergeImageStacks(block, target) {
+  const stackId = target.dataset.stackId || block.dataset.stackId || `stack-${state.nextStackId}`;
+  if (!target.dataset.stackId && !block.dataset.stackId) state.nextStackId += 1;
+
+  const members = new Set([
+    ...getStackMembers(block),
+    ...getStackMembers(target),
+    block,
+    target
+  ]);
+
+  members.forEach((member) => {
+    member.dataset.stackId = stackId;
+    member.classList.add("is-stacked");
+  });
+
+  bringStackToFront(stackId, block);
+}
+
+function getStackMembers(block) {
+  const stackId = block.dataset.stackId;
+  if (!stackId) return [block];
+  return [...document.querySelectorAll(`.image-block[data-stack-id="${stackId}"]`)];
+}
+
+function getMoveTargets(block) {
+  if (!isStackableImageBlock(block) || !block.dataset.stackId) return [block];
+  return getStackMembers(block);
+}
+
+function bringStackToFront(stackId, topBlock) {
+  const members = [...document.querySelectorAll(`.image-block[data-stack-id="${stackId}"]`)]
+    .sort((a, b) => Number(a.dataset.layer || 0) - Number(b.dataset.layer || 0))
+    .filter((member) => member !== topBlock);
+
+  members.push(topBlock);
+  members.forEach(setTopLayer);
+}
+
+function cleanupStack(stackId) {
+  if (!stackId) return;
+  const members = [...document.querySelectorAll(`.image-block[data-stack-id="${stackId}"]`)];
+  if (members.length > 1) return;
+
+  members.forEach((member) => {
+    delete member.dataset.stackId;
+    member.classList.remove("is-stacked");
+  });
+}
+
 function getMediaViewportRect(block) {
   const blockRect = block.getBoundingClientRect();
   const captionHeight = block.querySelector(".media-caption")?.getBoundingClientRect().height || 0;
@@ -1040,6 +1186,7 @@ function enableBlockDrag(block) {
   let dragging = false;
   let didDrag = false;
   let lastPoint = null;
+  let shake = null;
   const touch = {
     points: new Map(),
     pinch: null,
@@ -1072,6 +1219,7 @@ function enableBlockDrag(block) {
     dragging = true;
     didDrag = false;
     lastPoint = { x: event.clientX, y: event.clientY };
+    shake = createShakeTracker();
     block.setPointerCapture(event.pointerId);
   });
 
@@ -1100,7 +1248,10 @@ function enableBlockDrag(block) {
 
     if (!dragging || !lastPoint) return;
     const current = { x: event.clientX, y: event.clientY };
-    moveBlockBy(block, current.x - lastPoint.x, current.y - lastPoint.y);
+    const dx = current.x - lastPoint.x;
+    const dy = current.y - lastPoint.y;
+    trackStackShake(block, shake, dx, dy);
+    moveBlockBy(block, dx, dy);
     updateStackHover(block);
     didDrag = true;
     lastPoint = current;
@@ -1115,6 +1266,7 @@ function enableBlockDrag(block) {
 
     dragging = false;
     lastPoint = null;
+    shake = null;
     if (didDrag) {
       settleImageStack(block);
     } else {
@@ -1132,6 +1284,7 @@ function enableBlockDrag(block) {
 
     dragging = false;
     lastPoint = null;
+    shake = null;
     didDrag = false;
     clearStackHover(block);
   });
