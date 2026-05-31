@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Spatial Notebook</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app" aria-label="Spatial notebook canvas">
+      <section class="canvas-shell" aria-label="Infinite spatial canvas">
+        <div class="world" id="world">
+          <div class="grid-layer" aria-hidden="true"></div>
+          <div class="origin-pin" aria-hidden="true"></div>
+          <div class="empty-note" id="emptyNote">
+            <span>Spatial Notebook</span>
+            <strong>Drop image or 3D files.</strong>
+          </div>
+        </div>
+      </section>
+
+      <div class="top-chip" aria-live="polite">
+        <span class="status-dot" id="statusDot"></span>
+        <span id="statusText">Camera idle</span>
+      </div>
+
+      <div class="gesture-chip" id="gestureChip">
+        <span id="gestureLabel">Open palm</span>
+      </div>
+
+      <video class="webcam-pip" id="webcam" autoplay muted playsinline aria-label="Webcam preview"></video>
+
+      <div class="hand-cursor" id="handCursor" aria-hidden="true"></div>
+
+      <label class="upload-fab" aria-label="Upload media">
+        <input id="fileInput" type="file" accept="image/*,.obj,.stl,.glb,.gltf,model/*" multiple>
+        <span aria-hidden="true">+</span>
+      </label>
+    </main>
+
+    <script src="app.js?v=hand-hold-media"></script>
+  </body>
+</html>
