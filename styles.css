@@ -178,6 +178,13 @@ input {
     0 22px 70px rgba(23, 105, 255, 0.18);
 }
 
+.image-block.is-unstacking {
+  border-color: color-mix(in srgb, var(--grab) 64%, var(--line));
+  box-shadow:
+    0 0 0 7px color-mix(in srgb, var(--grab) 16%, transparent),
+    0 24px 72px rgba(255, 88, 79, 0.2);
+}
+
 .delete-block {
   position: absolute;
   right: 10px;
@@ -383,15 +390,16 @@ input {
   left: 0;
   top: 0;
   z-index: 6;
-  width: 28px;
-  height: 28px;
-  margin: -14px 0 0 -14px;
-  border: 2px solid var(--cursor);
-  border-radius: 50%;
+  width: 72px;
+  height: 72px;
+  margin: -36px 0 0 -36px;
+  background: url("assets/hand-cursor.svg") center / contain no-repeat;
+  border: 0;
   opacity: 0;
   pointer-events: none;
   transform: translate3d(50vw, 50vh, 0) scale(1);
-  transition: opacity 160ms ease, border-color 160ms ease, background 160ms ease, transform 70ms linear;
+  filter: drop-shadow(0 10px 22px rgba(0, 0, 0, 0.28));
+  transition: opacity 160ms ease, filter 160ms ease, transform 70ms linear;
 }
 
 .hand-cursor.is-live {
@@ -399,14 +407,16 @@ input {
 }
 
 .hand-cursor.is-grabbing {
-  border-color: var(--grab);
-  background: color-mix(in srgb, var(--grab) 24%, transparent);
+  filter:
+    drop-shadow(0 0 12px color-mix(in srgb, var(--grab) 58%, transparent))
+    drop-shadow(0 10px 22px rgba(0, 0, 0, 0.3));
   transform: translate3d(var(--cursor-x, 50vw), var(--cursor-y, 50vh), 0) scale(0.68);
 }
 
 .hand-cursor.is-pinching {
-  border-color: var(--cursor);
-  background: color-mix(in srgb, var(--cursor) 18%, transparent);
+  filter:
+    drop-shadow(0 0 12px color-mix(in srgb, var(--cursor) 58%, transparent))
+    drop-shadow(0 10px 22px rgba(0, 0, 0, 0.3));
 }
 
 @media (max-width: 720px) {
