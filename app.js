@@ -8,32 +8,47 @@ const statusDot = document.querySelector("#statusDot");
 const gestureChip = document.querySelector("#gestureChip");
 const gestureLabel = document.querySelector("#gestureLabel");
 const emptyNote = document.querySelector("#emptyNote");
+const uploadFab = document.querySelector(".upload-fab");
 
 const VISION_TASKS_URL = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
 const VISION_WASM_PATH = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm";
 const HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 const MODEL_EXTENSIONS = new Set(["obj", "stl", "glb", "gltf"]);
+const LONG_PRESS_MS = 600;
+const LONG_PRESS_MOVE_TOLERANCE = 10;
+const STACK_OVERLAP_THRESHOLD = 0.32;
+const HAND_PINCH_MOVE_DEADZONE = 3;
+const HAND_PINCH_ZOOM_SENSITIVITY = 0.006;
 
 const state = {
   pan: { x: window.innerWidth / 2, y: window.innerHeight / 2 },
+  scale: 1,
   mediaCount: 0,
+  nextLayer: 1,
   lastVideoTime: -1,
   hand: {
     active: false,
     grabbing: false,
+    pinching: false,
+    pinchDirection: "",
     lastPoint: null,
-    heldBlock: null
+    heldBlock: null,
+    movedHeldBlock: false
   },
   pointer: {
     active: false,
-    lastPoint: null
-  }
+    lastPoint: null,
+    points: new Map(),
+    pinch: null
+  },
+  selectedBar: null
 };
 
 const landmarkTips = [8, 12, 16, 20];
 const landmarkPips = [6, 10, 14, 18];
 
 renderWorld();
+initLongPressSelection(uploadFab);
 startCamera();
 
 fileInput.addEventListener("change", (event) => {
@@ -55,8 +70,26 @@ window.addEventListener("drop", (event) => {
 
 window.addEventListener("resize", renderWorld);
 
+document.addEventListener("pointerdown", (event) => {
+  if (!event.target.closest(".selectable-bar")) deselectBar();
+}, true);
+
 app.addEventListener("pointerdown", (event) => {
   if (event.target.closest(".upload-fab") || event.target.closest(".media-block")) return;
+
+  if (event.pointerType === "touch") {
+    event.preventDefault();
+    trackCanvasPointer(event);
+    app.setPointerCapture(event.pointerId);
+
+    if (state.pointer.points.size === 2) {
+      startCanvasPinch();
+      state.pointer.active = false;
+      app.classList.remove("is-pointer-down");
+      return;
+    }
+  }
+
   state.pointer.active = true;
   state.pointer.lastPoint = { x: event.clientX, y: event.clientY };
   app.classList.add("is-pointer-down");
@@ -64,16 +97,37 @@ app.addEventListener("pointerdown", (event) => {
 });
 
 app.addEventListener("pointermove", (event) => {
+  if (event.pointerType === "touch" && state.pointer.points.has(event.pointerId)) {
+    event.preventDefault();
+    trackCanvasPointer(event);
+
+    if (state.pointer.pinch && state.pointer.points.size >= 2) {
+      updateCanvasPinch();
+      return;
+    }
+  }
+
   if (!state.pointer.active || !state.pointer.lastPoint) return;
   const current = { x: event.clientX, y: event.clientY };
   panBy(current.x - state.pointer.lastPoint.x, current.y - state.pointer.lastPoint.y);
   state.pointer.lastPoint = current;
 });
 
-app.addEventListener("pointerup", endPointerPan);
-app.addEventListener("pointercancel", endPointerPan);
+app.addEventListener("pointerup", endCanvasPointer);
+app.addEventListener("pointercancel", endCanvasPointer);
 
-function endPointerPan() {
+function endCanvasPointer(event) {
+  if (event.pointerType === "touch") {
+    state.pointer.points.delete(event.pointerId);
+    state.pointer.pinch = null;
+
+    const remaining = [...state.pointer.points.values()][0];
+    state.pointer.lastPoint = remaining || null;
+    state.pointer.active = Boolean(remaining);
+    app.classList.toggle("is-pointer-down", Boolean(remaining));
+    return;
+  }
+
   state.pointer.active = false;
   state.pointer.lastPoint = null;
   app.classList.remove("is-pointer-down");
@@ -158,10 +212,28 @@ function handleHandLandmarkerResults(results) {
 
   const point = handPointToScreen(hand[9]);
   const grabbing = isClosedFist(hand);
+  const pinching = isPinching(hand) && !grabbing;
   const wasGrabbing = state.hand.grabbing;
+  const wasPinching = state.hand.pinching;
 
   state.hand.active = true;
-  moveHandCursor(point, grabbing);
+  moveHandCursor(point, grabbing, pinching);
+
+  if (pinching) {
+    if (wasGrabbing) releaseHeldBlock();
+    updateHandPinchZoom(point, wasPinching);
+    state.hand.pinching = true;
+    state.hand.grabbing = false;
+    state.hand.lastPoint = point;
+    app.classList.remove("is-grabbing");
+    updateGesture(getPinchGestureLabel(), false, true);
+    return;
+  }
+
+  if (!pinching && wasPinching) {
+    state.hand.pinching = false;
+    state.hand.pinchDirection = "";
+  }
 
   if (grabbing && !wasGrabbing) {
     holdBlockAtPoint(point);
@@ -173,6 +245,8 @@ function handleHandLandmarkerResults(results) {
 
     if (state.hand.heldBlock) {
       moveBlockBy(state.hand.heldBlock, dx, dy);
+      updateStackHover(state.hand.heldBlock);
+      state.hand.movedHeldBlock = true;
     } else {
       panBy(dx * 1.18, dy * 1.18);
     }
@@ -183,6 +257,7 @@ function handleHandLandmarkerResults(results) {
   }
 
   state.hand.grabbing = grabbing;
+  state.hand.pinching = false;
   state.hand.lastPoint = point;
   app.classList.toggle("is-grabbing", grabbing);
   updateGesture(getGestureLabel(grabbing), grabbing);
@@ -198,19 +273,29 @@ function handPointToScreen(landmark) {
 function holdBlockAtPoint(point) {
   const block = document.elementFromPoint(point.x, point.y)?.closest(".media-block");
   state.hand.heldBlock = block || null;
+  state.hand.movedHeldBlock = false;
   state.hand.heldBlock?.classList.add("is-held");
 }
 
 function releaseHeldBlock() {
+  if (state.hand.heldBlock && state.hand.movedHeldBlock) {
+    settleImageStack(state.hand.heldBlock);
+  } else if (state.hand.heldBlock) {
+    clearStackHover(state.hand.heldBlock);
+  }
   state.hand.heldBlock?.classList.remove("is-held");
   state.hand.heldBlock = null;
+  state.hand.movedHeldBlock = false;
 }
 
 function resetHandState() {
   releaseHeldBlock();
   state.hand.active = false;
   state.hand.grabbing = false;
+  state.hand.pinching = false;
+  state.hand.pinchDirection = "";
   state.hand.lastPoint = null;
+  state.hand.movedHeldBlock = false;
 }
 
 function getGestureLabel(grabbing) {
@@ -218,11 +303,40 @@ function getGestureLabel(grabbing) {
   return state.hand.heldBlock ? "Holding media" : "Closed fist";
 }
 
+function getPinchGestureLabel() {
+  if (state.hand.pinchDirection === "in") return "Pinch zoom in";
+  if (state.hand.pinchDirection === "out") return "Pinch zoom out";
+  return "Pinch ready";
+}
+
+function updateHandPinchZoom(point, wasPinching) {
+  if (!wasPinching || !state.hand.lastPoint) {
+    state.hand.pinchDirection = "";
+    return;
+  }
+
+  const dx = point.x - state.hand.lastPoint.x;
+  if (Math.abs(dx) < HAND_PINCH_MOVE_DEADZONE) {
+    state.hand.pinchDirection = "";
+    return;
+  }
+
+  const factor = 1 + Math.min(Math.abs(dx) * HAND_PINCH_ZOOM_SENSITIVITY, 0.08);
+  state.hand.pinchDirection = dx > 0 ? "in" : "out";
+  zoomCanvasBy(point, dx > 0 ? factor : 1 / factor);
+}
+
 function moveBlockBy(block, dx, dy) {
-  const left = parseFloat(block.style.left) + dx;
-  const top = parseFloat(block.style.top) + dy;
+  const left = parseFloat(block.style.left) + dx / state.scale;
+  const top = parseFloat(block.style.top) + dy / state.scale;
   block.style.left = `${left}px`;
   block.style.top = `${top}px`;
+}
+
+function setTopLayer(block) {
+  state.nextLayer += 1;
+  block.style.zIndex = String(state.nextLayer);
+  block.dataset.layer = String(state.nextLayer);
 }
 
 function isClosedFist(hand) {
@@ -239,21 +353,30 @@ function isClosedFist(hand) {
   return folded >= 3 && thumbTucked;
 }
 
+function isPinching(hand) {
+  const palmSize = distance(hand[0], hand[9]) || 0.1;
+  const pinchDistance = distance(hand[4], hand[8]);
+  const middleExtended = hand[12].y < hand[10].y;
+  return pinchDistance < palmSize * 0.34 && middleExtended;
+}
+
 function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
 }
 
-function moveHandCursor(point, grabbing) {
+function moveHandCursor(point, grabbing, pinching = false) {
   handCursor.style.setProperty("--cursor-x", `${point.x}px`);
   handCursor.style.setProperty("--cursor-y", `${point.y}px`);
-  handCursor.style.transform = `translate3d(${point.x}px, ${point.y}px, 0) scale(${grabbing ? 0.68 : 1})`;
+  handCursor.style.transform = `translate3d(${point.x}px, ${point.y}px, 0) scale(${grabbing ? 0.68 : pinching ? 1.28 : 1})`;
   handCursor.classList.add("is-live");
   handCursor.classList.toggle("is-grabbing", grabbing);
+  handCursor.classList.toggle("is-pinching", pinching);
 }
 
-function updateGesture(label, grabbing) {
+function updateGesture(label, grabbing, pinching = false) {
   gestureLabel.textContent = label;
   gestureChip.classList.toggle("is-grabbing", grabbing);
+  gestureChip.classList.toggle("is-pinching", pinching);
 }
 
 function setStatus(label, tone = "idle") {
@@ -269,7 +392,134 @@ function panBy(dx, dy) {
 }
 
 function renderWorld() {
-  world.style.transform = `translate3d(${state.pan.x}px, ${state.pan.y}px, 0)`;
+  world.style.transform = `translate3d(${state.pan.x}px, ${state.pan.y}px, 0) scale(${state.scale})`;
+}
+
+function trackCanvasPointer(event) {
+  state.pointer.points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+}
+
+function startCanvasPinch() {
+  const points = getFirstTwoPoints(state.pointer.points);
+  if (!points) return;
+
+  const center = getMidpoint(points[0], points[1]);
+  state.pointer.pinch = {
+    startDistance: getDistance(points[0], points[1]),
+    startScale: state.scale,
+    worldPoint: {
+      x: (center.x - state.pan.x) / state.scale,
+      y: (center.y - state.pan.y) / state.scale
+    }
+  };
+}
+
+function updateCanvasPinch() {
+  const points = getFirstTwoPoints(state.pointer.points);
+  if (!points || !state.pointer.pinch) return;
+
+  const center = getMidpoint(points[0], points[1]);
+  const ratio = getDistance(points[0], points[1]) / state.pointer.pinch.startDistance;
+  const nextScale = clamp(state.pointer.pinch.startScale * ratio, 1, 4);
+
+  zoomCanvasAt(center, nextScale, state.pointer.pinch.worldPoint);
+}
+
+function zoomCanvasBy(center, factor) {
+  const worldPoint = {
+    x: (center.x - state.pan.x) / state.scale,
+    y: (center.y - state.pan.y) / state.scale
+  };
+  zoomCanvasAt(center, state.scale * factor, worldPoint);
+}
+
+function zoomCanvasAt(center, nextScale, worldPoint) {
+  const scale = clamp(nextScale, 1, 4);
+  state.scale = scale;
+  state.pan.x = center.x - worldPoint.x * scale;
+  state.pan.y = center.y - worldPoint.y * scale;
+  renderWorld();
+}
+
+function getFirstTwoPoints(points) {
+  const values = [...points.values()];
+  return values.length >= 2 ? values.slice(0, 2) : null;
+}
+
+function getDistance(a, b) {
+  return Math.hypot(a.x - b.x, a.y - b.y);
+}
+
+function getMidpoint(a, b) {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2
+  };
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function initLongPressSelection(element) {
+  if (!element) return;
+
+  element.classList.add("selectable-bar");
+
+  let timer = null;
+  let origin = null;
+  let activePointerId = null;
+  let suppressNextClick = false;
+
+  const clearTimer = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    origin = null;
+    activePointerId = null;
+  };
+
+  element.addEventListener("pointerdown", (event) => {
+    if (event.button && event.button !== 0) return;
+    if (state.pointer.pinch || event.target.closest(".media-block")?.classList.contains("is-held")) return;
+
+    origin = { x: event.clientX, y: event.clientY };
+    activePointerId = event.pointerId;
+    timer = window.setTimeout(() => {
+      suppressNextClick = true;
+      selectBar(element);
+      timer = null;
+    }, LONG_PRESS_MS);
+  });
+
+  element.addEventListener("pointermove", (event) => {
+    if (event.pointerId !== activePointerId || !origin) return;
+    if (getDistance(origin, { x: event.clientX, y: event.clientY }) > LONG_PRESS_MOVE_TOLERANCE) {
+      clearTimer();
+    }
+  });
+
+  element.addEventListener("pointerup", clearTimer);
+  element.addEventListener("pointercancel", clearTimer);
+  element.addEventListener("lostpointercapture", clearTimer);
+
+  element.addEventListener("click", (event) => {
+    if (!suppressNextClick) return;
+    suppressNextClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+}
+
+function selectBar(element) {
+  if (state.selectedBar === element) return;
+  deselectBar();
+  state.selectedBar = element;
+  element.classList.add("is-bar-selected");
+}
+
+function deselectBar() {
+  state.selectedBar?.classList.remove("is-bar-selected");
+  state.selectedBar = null;
 }
 
 function addFiles(files, screenPoint) {
@@ -318,21 +568,23 @@ function nextBlockPosition(index, screenPoint) {
   const staggerY = Math.floor(index / 3) * 44;
 
   return {
-    x: center.x - state.pan.x - 160 + staggerX,
-    y: center.y - state.pan.y - 120 + staggerY
+    x: (center.x - state.pan.x) / state.scale - 160 + staggerX,
+    y: (center.y - state.pan.y) / state.scale - 120 + staggerY
   };
 }
 
 function createImageBlock(file, url, position) {
   const block = document.createElement("article");
-  block.className = "media-block";
+  block.className = "media-block image-block";
   block.style.left = `${position.x}px`;
   block.style.top = `${position.y}px`;
   block.dataset.objectUrl = url;
+  setTopLayer(block);
 
   const media = document.createElement("img");
   media.src = url;
   media.alt = file.name;
+  initZoomTarget(media);
 
   const caption = document.createElement("div");
   caption.className = "media-caption";
@@ -360,6 +612,7 @@ function createModelBlock(file, position) {
   canvas.className = "model-preview";
   canvas.width = 760;
   canvas.height = 500;
+  initZoomTarget(canvas);
 
   const caption = document.createElement("div");
   caption.className = "media-caption";
@@ -385,11 +638,13 @@ function createDeleteButton() {
   button.type = "button";
   button.setAttribute("aria-label", "Remove media");
   button.textContent = "×";
+  initLongPressSelection(button);
   return button;
 }
 
 function removeMediaBlock(block) {
   if (block.dataset.objectUrl) URL.revokeObjectURL(block.dataset.objectUrl);
+  if (block.contains(state.selectedBar)) deselectBar();
   block.remove();
   state.mediaCount = Math.max(0, state.mediaCount - 1);
   if (state.hand.heldBlock === block) releaseHeldBlock();
@@ -635,13 +890,187 @@ function drawModelBackground(ctx, width, height) {
   }
 }
 
+function initZoomTarget(element) {
+  element.dataset.zoomScale = "1";
+  element.dataset.zoomX = "0";
+  element.dataset.zoomY = "0";
+  applyMediaZoom(element);
+}
+
+function getZoomTarget(target) {
+  return target.closest?.(".media-block img, .model-preview") || null;
+}
+
+function getMediaZoom(element) {
+  return {
+    scale: Number(element.dataset.zoomScale || 1),
+    x: Number(element.dataset.zoomX || 0),
+    y: Number(element.dataset.zoomY || 0)
+  };
+}
+
+function setMediaZoom(element, zoom) {
+  const scale = clamp(zoom.scale, 1, 4);
+  const x = scale === 1 ? 0 : zoom.x;
+  const y = scale === 1 ? 0 : zoom.y;
+
+  element.dataset.zoomScale = String(scale);
+  element.dataset.zoomX = String(x);
+  element.dataset.zoomY = String(y);
+  element.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+}
+
+function applyMediaZoom(element) {
+  setMediaZoom(element, getMediaZoom(element));
+}
+
+function startMediaPinch(block, points, element) {
+  const pair = getFirstTwoPoints(points);
+  if (!pair || !element) return null;
+
+  const center = getMidpoint(pair[0], pair[1]);
+  const zoom = getMediaZoom(element);
+  const rect = getMediaViewportRect(block);
+
+  return {
+    element,
+    startDistance: getDistance(pair[0], pair[1]),
+    startScale: zoom.scale,
+    localPoint: {
+      x: (center.x - rect.left - zoom.x) / zoom.scale,
+      y: (center.y - rect.top - zoom.y) / zoom.scale
+    }
+  };
+}
+
+function updateMediaPinch(block, points, pinch) {
+  const pair = getFirstTwoPoints(points);
+  if (!pair || !pinch) return;
+
+  const center = getMidpoint(pair[0], pair[1]);
+  const rect = getMediaViewportRect(block);
+  const ratio = getDistance(pair[0], pair[1]) / pinch.startDistance;
+  const scale = clamp(pinch.startScale * ratio, 1, 4);
+
+  setMediaZoom(pinch.element, {
+    scale,
+    x: center.x - rect.left - pinch.localPoint.x * scale,
+    y: center.y - rect.top - pinch.localPoint.y * scale
+  });
+}
+
+function panMediaBy(element, dx, dy) {
+  const zoom = getMediaZoom(element);
+  if (zoom.scale <= 1) return;
+  setMediaZoom(element, {
+    scale: zoom.scale,
+    x: zoom.x + dx,
+    y: zoom.y + dy
+  });
+}
+
+function updateStackHover(block) {
+  if (!isStackableImageBlock(block)) return;
+
+  const target = findStackTarget(block);
+  clearStackHover(block);
+  target?.classList.add("is-stack-target");
+}
+
+function settleImageStack(block) {
+  if (!isStackableImageBlock(block)) return;
+
+  const target = findStackTarget(block);
+  clearStackHover(block);
+  if (!target) return;
+
+  setTopLayer(block);
+  block.classList.add("is-stacked");
+}
+
+function clearStackHover(exceptBlock) {
+  document.querySelectorAll(".image-block.is-stack-target").forEach((block) => {
+    if (block !== exceptBlock) block.classList.remove("is-stack-target");
+  });
+}
+
+function findStackTarget(block) {
+  const draggedRect = block.getBoundingClientRect();
+  let bestTarget = null;
+  let bestRatio = 0;
+
+  document.querySelectorAll(".image-block").forEach((candidate) => {
+    if (candidate === block) return;
+
+    const ratio = getOverlapRatio(draggedRect, candidate.getBoundingClientRect());
+    if (ratio > bestRatio) {
+      bestRatio = ratio;
+      bestTarget = candidate;
+    }
+  });
+
+  return bestRatio >= STACK_OVERLAP_THRESHOLD ? bestTarget : null;
+}
+
+function getOverlapRatio(a, b) {
+  const width = Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+  const height = Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+  const overlapArea = width * height;
+  const smallerArea = Math.min(a.width * a.height, b.width * b.height) || 1;
+  return overlapArea / smallerArea;
+}
+
+function isStackableImageBlock(block) {
+  return block.classList.contains("image-block");
+}
+
+function getMediaViewportRect(block) {
+  const blockRect = block.getBoundingClientRect();
+  const captionHeight = block.querySelector(".media-caption")?.getBoundingClientRect().height || 0;
+
+  return {
+    left: blockRect.left,
+    top: blockRect.top,
+    width: blockRect.width,
+    height: blockRect.height - captionHeight
+  };
+}
+
 function enableBlockDrag(block) {
   let dragging = false;
+  let didDrag = false;
   let lastPoint = null;
+  const touch = {
+    points: new Map(),
+    pinch: null,
+    pan: null
+  };
 
   block.addEventListener("pointerdown", (event) => {
     if (event.target.closest(".delete-block")) return;
+
+    if (event.pointerType === "touch") {
+      event.preventDefault();
+      touch.points.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      block.setPointerCapture(event.pointerId);
+
+      if (touch.points.size === 2) {
+        touch.pinch = startMediaPinch(block, touch.points, getZoomTarget(event.target) || block.querySelector(".model-preview, img"));
+        touch.pan = null;
+        dragging = false;
+        return;
+      }
+
+      const target = getZoomTarget(event.target);
+      if (target && getMediaZoom(target).scale > 1) {
+        touch.pan = { element: target, lastPoint: { x: event.clientX, y: event.clientY } };
+        dragging = false;
+        return;
+      }
+    }
+
     dragging = true;
+    didDrag = false;
     lastPoint = { x: event.clientX, y: event.clientY };
     block.setPointerCapture(event.pointerId);
   });
@@ -652,22 +1081,58 @@ function enableBlockDrag(block) {
   });
 
   block.addEventListener("pointermove", (event) => {
+    if (event.pointerType === "touch" && touch.points.has(event.pointerId)) {
+      event.preventDefault();
+      const current = { x: event.clientX, y: event.clientY };
+      touch.points.set(event.pointerId, current);
+
+      if (touch.pinch && touch.points.size >= 2) {
+        updateMediaPinch(block, touch.points, touch.pinch);
+        return;
+      }
+
+      if (touch.pan) {
+        panMediaBy(touch.pan.element, current.x - touch.pan.lastPoint.x, current.y - touch.pan.lastPoint.y);
+        touch.pan.lastPoint = current;
+        return;
+      }
+    }
+
     if (!dragging || !lastPoint) return;
     const current = { x: event.clientX, y: event.clientY };
-    const left = parseFloat(block.style.left) + current.x - lastPoint.x;
-    const top = parseFloat(block.style.top) + current.y - lastPoint.y;
-    block.style.left = `${left}px`;
-    block.style.top = `${top}px`;
+    moveBlockBy(block, current.x - lastPoint.x, current.y - lastPoint.y);
+    updateStackHover(block);
+    didDrag = true;
     lastPoint = current;
   });
 
-  block.addEventListener("pointerup", () => {
+  block.addEventListener("pointerup", (event) => {
+    if (event.pointerType === "touch") {
+      touch.points.delete(event.pointerId);
+      if (touch.points.size < 2) touch.pinch = null;
+      if (!touch.points.size) touch.pan = null;
+    }
+
     dragging = false;
     lastPoint = null;
+    if (didDrag) {
+      settleImageStack(block);
+    } else {
+      clearStackHover(block);
+    }
+    didDrag = false;
   });
 
-  block.addEventListener("pointercancel", () => {
+  block.addEventListener("pointercancel", (event) => {
+    if (event.pointerType === "touch") {
+      touch.points.delete(event.pointerId);
+      touch.pinch = null;
+      touch.pan = null;
+    }
+
     dragging = false;
     lastPoint = null;
+    didDrag = false;
+    clearStackHover(block);
   });
 }
